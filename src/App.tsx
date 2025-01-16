@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { Search, Folder, AlertCircle, Sun, Moon, Download, Wand2, SlidersHorizontal } from 'lucide-react';
 import * as PDFJS from 'pdfjs-dist';
 import mammoth from 'mammoth';
@@ -26,7 +26,6 @@ interface SearchResult {
   }>;
   matchCount: number;
   totalOccurrences: number;
-  rawText?: string;
 }
 
 interface SearchOptions {
@@ -34,6 +33,36 @@ interface SearchOptions {
   caseSensitive: boolean;
   wholeWord: boolean;
 }
+
+interface ProcessingStats {
+  totalFiles: number;
+  processedFiles: number;
+  successfulFiles: number;
+  failedFiles: number;
+  unsupportedFiles: number;
+  totalMatches: number;
+  memoryUsage: number;
+}
+
+interface ExtendedPerformance extends Performance {
+  memory?: {
+    usedJSHeapSize: number;
+    totalJSHeapSize: number;
+    jsHeapSizeLimit: number;
+  };
+}
+
+const logProcessingStats = (stats: ProcessingStats) => {
+  console.log('\n=== Processing Statistics ===');
+  console.log(`Total Files: ${stats.totalFiles}`);
+  console.log(`Processed: ${stats.processedFiles}`);
+  console.log(`Successful: ${stats.successfulFiles}`);
+  console.log(`Failed: ${stats.failedFiles}`);
+  console.log(`Unsupported: ${stats.unsupportedFiles}`);
+  console.log(`Total Matches: ${stats.totalMatches}`);
+  console.log(`Memory Usage: ${Math.round(stats.memoryUsage / 1024 / 1024)}MB`);
+  console.log('=========================\n');
+};
 
 function App() {
   const [searchTerms, setSearchTerms] = useState<string[]>([]);
@@ -52,6 +81,8 @@ function App() {
     wholeWord: false,
   });
   const [showSearchOptions, setShowSearchOptions] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const ITEMS_PER_PAGE = 50;
 
   useEffect(() => {
     if (!isWorkerInitialized) {
@@ -66,40 +97,57 @@ function App() {
   }, [isDarkMode]);
 
   const extractTextFromPDF = async (file: File): Promise<string> => {
+    let loadingTask = null;
     try {
-      const arrayBuffer = await file.arrayBuffer();
-      const loadingTask = PDFJS.getDocument({ data: arrayBuffer });
+      // Log start of PDF processing
+      console.log(`Starting PDF extraction: ${file.name} (${Math.round(file.size / 1024)}KB)`);
+      
+      loadingTask = PDFJS.getDocument({ 
+        data: await file.arrayBuffer(),
+        // Only use valid options
+        disableFontFace: true
+      });
+      
       const pdf = await loadingTask.promise;
-      let fullText = '';
+      console.log(`PDF loaded: ${file.name}, Pages: ${pdf.numPages}`);
+      
+      const textChunks: string[] = [];
       
       for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        
-        // Get regular text content
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items
-          .map((item: any) => item.str)
-          .join(' ');
-        
-        // Get annotations (including form fields)
-        const annotations = await page.getAnnotations();
-        const annotationText = annotations
-          .filter(annotation => 
-            annotation.fieldType === 'Tx' || // Text fields
-            annotation.fieldType === 'Ch' || // Choice fields (dropdown/list)
-            annotation.fieldValue !== undefined
-          )
-          .map(annotation => annotation.fieldValue)
-          .filter(Boolean)
-          .join(' ');
-        
-        fullText += `Page ${i}:\n${pageText}\n${annotationText}\n\n`;
+        try {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items
+            .map((item: any) => item.str)
+            .join(' ');
+          textChunks.push(`Page ${i}:\n${pageText}`);
+          
+          // Clean up page resources
+          page.cleanup();
+          
+        } catch (pageError) {
+          console.warn(`Error processing page ${i} in ${file.name}:`, pageError);
+          textChunks.push(`Page ${i}: [Error extracting text]`);
+        }
       }
+
+      // Clean up PDF resources
+      pdf.cleanup();
       
-      return fullText;
+      const extractedText = textChunks.join('\n\n');
+      console.log(`Completed PDF extraction: ${file.name}, Extracted ${Math.round(extractedText.length / 1024)}KB of text`);
+      
+      return extractedText;
+
     } catch (err) {
-      console.error('Error extracting PDF text:', err);
-      throw new Error('Failed to extract text from PDF');
+      console.error(`Failed to process PDF ${file.name}:`, err);
+      throw new Error(`PDF processing failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      
+    } finally {
+      // Ensure cleanup happens even if there's an error
+      if (loadingTask) {
+        loadingTask.destroy();
+      }
     }
   };
 
@@ -187,97 +235,150 @@ function App() {
     const files = e.target.files;
     if (!files || searchTerms.length === 0) return;
 
+    const stats: ProcessingStats = {
+      totalFiles: files.length,
+      processedFiles: 0,
+      successfulFiles: 0,
+      failedFiles: 0,
+      unsupportedFiles: 0,
+      totalMatches: 0,
+      memoryUsage: 0
+    };
+
     setIsSearching(true);
     setError(null);
     setResults([]);
     setProcessedFiles(0);
     setTotalFiles(files.length);
-    
-    const searchResults: SearchResult[] = [];
+
+    // Process files in smaller batches
+    const BATCH_SIZE = 50;
+    const fileArray = Array.from(files);
+    const batches = Math.ceil(fileArray.length / BATCH_SIZE);
 
     try {
-      for (const file of Array.from(files)) {
-        let result: SearchResult = {
-          fileName: file.name,
-          filePath: file.webkitRelativePath || file.name,
-          fileType: file.type || 'unknown',
-          status: 'success',
-          matches: [],
-          matchCount: 0,
-          totalOccurrences: 0
-        };
+      for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
+        const batchStart = batchIndex * BATCH_SIZE;
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, fileArray.length);
+        const batch = fileArray.slice(batchStart, batchEnd);
 
-        try {
-          let text = '';
-          
-          if (file.type === 'application/pdf') {
-            text = await extractTextFromPDF(file);
-          } else if (
-            file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-            file.type === 'application/msword'
-          ) {
-            text = await extractTextFromWord(file);
-          } else if (file.type.includes('text') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
-            text = await file.text();
-          } else {
-            result.status = 'unsupported';
-            result.error = 'Unsupported file type';
-            searchResults.push(result);
-            setProcessedFiles(prev => prev + 1);
-            continue;
-          }
+        // Process batch
+        const batchResults = await Promise.all(
+          batch.map(async (file) => {
+            console.log(`Processing: ${file.name}`);
+            let result: SearchResult = {
+              fileName: file.name,
+              filePath: file.webkitRelativePath || file.name,
+              fileType: file.type || 'unknown',
+              status: 'success',
+              matches: [],
+              matchCount: 0,
+              totalOccurrences: 0
+            };
 
-          result.rawText = text;
-          const matches = findMatches(text);
-          result.matches = matches;
-          result.matchCount = matches.length;
-          result.totalOccurrences = matches.reduce((sum, match) => sum + match.occurrences, 0);
-          
-        } catch (err) {
-          result.status = 'error';
-          result.error = err instanceof Error ? err.message : 'Unknown error';
-        }
+            try {
+              if (file.size > 50 * 1024 * 1024) { // Skip files larger than 50MB
+                throw new Error('File too large (>50MB)');
+              }
 
-        searchResults.push(result);
-        setProcessedFiles(prev => prev + 1);
-        // Update results in real-time
-        setResults(prev => [...prev, result].sort((a, b) => b.matchCount - a.matchCount));
+              let text = '';
+              console.log(`Starting ${file.name} (${Math.round(file.size / 1024)}KB, type: ${file.type})`);
+              
+              if (file.type === 'application/pdf') {
+                text = await extractTextFromPDF(file);
+              } else if (
+                file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+                file.type === 'application/msword'
+              ) {
+                text = await extractTextFromWord(file);
+              } else if (file.type.includes('text') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+                text = await file.text();
+              } else {
+                result.status = 'unsupported';
+                result.error = 'Unsupported file type';
+                stats.unsupportedFiles++;
+                console.log(`Skipped unsupported file: ${file.name} (${file.type})`);
+                return result;
+              }
+
+              const matches = findMatches(text);
+              result.matches = matches;
+              result.matchCount = matches.length;
+              result.totalOccurrences = matches.reduce((sum, match) => sum + match.occurrences, 0);
+              stats.successfulFiles++;
+              stats.totalMatches += result.totalOccurrences;
+              
+              console.log(`Successfully processed ${file.name}: ${result.matchCount} matches, ${result.totalOccurrences} occurrences`);
+
+            } catch (err) {
+              result.status = 'error';
+              result.error = err instanceof Error ? err.message : 'Unknown error';
+              console.error(`Error processing ${file.name}:`, err);
+              stats.failedFiles++;
+            }
+
+            return result;
+          })
+        );
+
+        // Update state with batch results
+        setResults(prev => [...prev, ...batchResults].sort((a, b) => b.matchCount - a.matchCount));
+        stats.processedFiles += batch.length;
+        setProcessedFiles(stats.processedFiles);
+
+        // Log progress after each batch
+        stats.memoryUsage = ((performance as ExtendedPerformance).memory?.usedJSHeapSize || 0);
+        logProcessingStats(stats);
+
+        // Add a small delay between batches to prevent UI freezing
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
-      
-      if (searchResults.every(r => r.matchCount === 0)) {
-        setError('No matches found in any of the selected files.');
-      }
+
     } catch (err) {
+      console.error('Search process error:', err);
       setError('An error occurred while searching the files.');
-      console.error(err);
     } finally {
       setIsSearching(false);
+      // Final statistics
+      stats.memoryUsage = ((performance as ExtendedPerformance).memory?.usedJSHeapSize || 0);
+      logProcessingStats(stats);
     }
-  }, [searchTerms, searchOptions]);
+  }, [searchTerms, searchOptions, extractTextFromPDF, extractTextFromWord, findMatches]);
 
   const downloadCSV = useCallback(() => {
     // Only include documents that have matches
     const matchingResults = results.filter(result => result.matchCount > 0);
     
+    // Create headers with search terms
     const headers = [
       'File Name',
       'File Path',
-      'File Type',
-      'Total Matches',
-      'Total Occurrences',
-      'Matching Lines'
+      ...searchTerms,
+      'Total Occurrences'
     ];
     
-    const rows = matchingResults.map(result => [
-      result.fileName,
-      result.filePath,
-      result.fileType,
-      result.matchCount,
-      result.totalOccurrences,
-      result.matches
-        .map(m => `Line ${m.lineNumber} (${m.occurrences} occurrences)`)
-        .join('; ')
-    ]);
+    const rows = matchingResults.map(result => {
+      // Count occurrences for each search term
+      const termCounts = searchTerms.map(term => {
+        // Use the same matching logic as the search
+        const regex = new RegExp(
+          searchOptions.wholeWord ? `\\b${term}\\b` : term,
+          searchOptions.caseSensitive ? 'g' : 'gi'
+        );
+        // Count matches in the concatenated text of all matches
+        const matchText = result.matches
+          .map(match => match.text)
+          .join(' ');
+        return (matchText.match(regex) || []).length;
+      });
+
+      return [
+        result.fileName,
+        result.filePath,
+        ...termCounts,
+        result.totalOccurrences
+      ];
+    });
 
     const csvContent = [
       headers.join(','),
@@ -287,9 +388,22 @@ function App() {
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `search-results-${searchTerms.join('-')}.csv`;
+    link.download = `search-results-${new Date().toISOString().slice(0, 10)}.csv`;
     link.click();
-  }, [results, searchTerms]);
+  }, [results, searchTerms, searchOptions]);
+
+  const paginatedResults = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    const endIndex = startIndex + ITEMS_PER_PAGE;
+    return results.slice(startIndex, endIndex);
+  }, [results, currentPage]);
+
+  const totalPages = Math.ceil(results.length / ITEMS_PER_PAGE);
+
+  const handlePageChange = (page: number) => {
+    setCurrentPage(page);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   return (
     <div className={`min-h-screen transition-colors duration-200 ${
@@ -519,7 +633,7 @@ function App() {
               </button>
             </div>
             <div className="space-y-4">
-              {results.map((result, index) => (
+              {paginatedResults.map((result, index) => (
                 <div key={index} className={`rounded-lg shadow p-4 hover:shadow-md transition-shadow ${
                   isDarkMode ? 'bg-gray-800' : 'bg-white'
                 }`}>
@@ -591,6 +705,70 @@ function App() {
                   </div>
                 </div>
               ))}
+              
+              {/* Pagination Controls */}
+              {totalPages > 1 && (
+                <div className={`flex justify-center items-center gap-2 mt-6 ${
+                  isDarkMode ? 'text-gray-300' : 'text-gray-600'
+                }`}>
+                  <button
+                    onClick={() => handlePageChange(currentPage - 1)}
+                    disabled={currentPage === 1}
+                    className={`px-3 py-1 rounded-md ${
+                      currentPage === 1
+                        ? 'opacity-50 cursor-not-allowed'
+                        : isDarkMode
+                          ? 'hover:bg-gray-700'
+                          : 'hover:bg-gray-100'
+                    }`}
+                  >
+                    Previous
+                  </button>
+                  
+                  <div className="flex items-center gap-1">
+                    {Array.from({ length: totalPages }, (_, i) => i + 1)
+                      .filter(page => {
+                        const distance = Math.abs(page - currentPage);
+                        return distance === 0 || distance === 1 || page === 1 || page === totalPages;
+                      })
+                      .map((page, index, array) => (
+                        <React.Fragment key={page}>
+                          {index > 0 && array[index - 1] !== page - 1 && (
+                            <span className="px-2">...</span>
+                          )}
+                          <button
+                            onClick={() => handlePageChange(page)}
+                            className={`w-8 h-8 rounded-md ${
+                              currentPage === page
+                                ? isDarkMode
+                                  ? 'bg-blue-600 text-white'
+                                  : 'bg-blue-500 text-white'
+                                : isDarkMode
+                                  ? 'hover:bg-gray-700'
+                                  : 'hover:bg-gray-100'
+                            }`}
+                          >
+                            {page}
+                          </button>
+                        </React.Fragment>
+                      ))}
+                  </div>
+
+                  <button
+                    onClick={() => handlePageChange(currentPage + 1)}
+                    disabled={currentPage === totalPages}
+                    className={`px-3 py-1 rounded-md ${
+                      currentPage === totalPages
+                        ? 'opacity-50 cursor-not-allowed'
+                        : isDarkMode
+                          ? 'hover:bg-gray-700'
+                          : 'hover:bg-gray-100'
+                    }`}
+                  >
+                    Next
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
